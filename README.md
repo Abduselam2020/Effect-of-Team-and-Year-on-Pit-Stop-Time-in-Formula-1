@@ -1,0 +1,1 @@
+This project is a job recommendation database system built to organize and analyze relationships between applicants, employers, and job postings. The system allows efficient storage, retrieval, and querying of data to support job application tracking and future recommendation features.

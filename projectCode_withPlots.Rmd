@@ -1,0 +1,572 @@
+---
+title: "projectcode2"
+author: "Owen Larson"
+date: "4/17/2026"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+cat("data link: https://www.kaggle.com/datasets/jtrotman/formula-1-pitstops-1994-2010, time must be char")
+```
+
+```{r}
+library(car)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(corrplot)
+```
+
+
+```{r dataClean, timeParse}
+str(pitstops)
+names(pitstops)
+head(pitstops)
+# Keep raw copies
+pitstops$Time_raw <- pitstops$Time
+pitstops$Total_raw <- pitstops$Total
+
+# Parse numeric time columns
+pitstops$Time <- as.numeric(pitstops$Time_raw)
+pitstops$Total_sec <- sapply(as.character(pitstops$Total_raw), function(val) {
+  val <- trimws(val)
+  if (is.na(val) || val == "") return(NA_real_)
+  if (grepl(":", val)) {
+    parts <- strsplit(val, ":")[[1]]
+    return(as.numeric(parts[1]) * 60 + as.numeric(parts[2]))
+  } else {
+    return(as.numeric(val))
+  }
+})
+
+# Recover missing Time from Total
+pitstops <- pitstops %>%
+  arrange(RaceId, DriverId, Stops) %>%
+  group_by(RaceId, DriverId) %>%
+  mutate(
+    prev_total = lag(Total_sec),
+    Time = case_when(
+      !is.na(Time) ~ Time,
+      is.na(Time) & Stops == 1 & !is.na(Total_sec) ~ Total_sec,
+      is.na(Time) & Stops > 1 & !is.na(Total_sec) & !is.na(prev_total) ~ Total_sec - prev_total,
+      TRUE ~ Time
+    )
+  ) %>%
+  ungroup()
+
+# Keep only the columns you actually want after reconstruction
+pitstops <- pitstops %>%
+  select(-Time_raw, -Total_raw, -Total_sec, -prev_total)
+
+# Final check
+sum(is.na(pitstops$Time))
+str(pitstops)
+summary(pitstops$Time)
+```
+
+```{r ogmodel, include=FALSE}
+# save a copy 
+pitstops_copy <- pitstops
+
+# trim out absurd outliers (slowest 1%) and catastrophically long stops as well as one NA team
+summary(pitstops_copy$Time)
+quantile(pitstops_copy$Time, probs = c(0.90, 0.95, 0.99, 0.995, 0.999), na.rm = TRUE)
+
+pitstops <- subset(pitstops, !is.na(Car) & trimws(Car) != "")
+
+pitstops <- subset(pitstops, Time > 0 & Time <= 127)
+
+# Create generation factor
+pitstops$Generation <- 
+  ifelse(pitstops$Year >= 1994 & pitstops$Year <= 2005, "Gen1_94_05", 
+  ifelse(pitstops$Year >= 2006 & pitstops$Year <= 2010, "Gen2_06_10", NA))
+
+pitstops$Generation <- factor(pitstops$Generation)
+
+# Subset relevant data
+pitstops_gen <- subset(pitstops, !is.na(Generation))
+
+# Fit two-way ANOVA with interaction
+model <- lm(Time ~ Car * Generation, data = pitstops_gen)
+
+# Type II SS (recommended for your setup)
+Anova(model, type = 2)
+
+par(mfrow = c(2,2))
+plot(model)
+```
+```{r logModel}
+# Rebuild generation dataset from cleaned pitstops
+pitstops$Generation <- 
+  ifelse(pitstops$Year >= 1994 & pitstops$Year <= 2005, "Gen1_94_05",
+  ifelse(pitstops$Year >= 2006 & pitstops$Year <= 2010, "Gen2_06_10", NA))
+
+pitstops$Generation <- factor(pitstops$Generation)
+
+pitstops_gen <- subset(pitstops, !is.na(Generation))
+pitstops_gen$Car <- droplevels(factor(pitstops_gen$Car))
+pitstops_gen$Generation <- droplevels(factor(pitstops_gen$Generation))
+
+# Final filtered / logged dataset
+pitstops_log <- subset(pitstops_gen,
+                       complete.cases(Time, Car, Generation) &
+                       is.finite(Time) &
+                       Time > 0 &
+                       Time <= 127)
+
+pitstops_log$Car <- droplevels(factor(pitstops_log$Car))
+pitstops_log$Generation <- droplevels(factor(pitstops_log$Generation))
+pitstops_log$logTime <- log(pitstops_log$Time)
+
+# original log Model
+model_log <- lm(logTime ~ Car * Generation, data = pitstops_log)
+
+Anova(model_log, type = 2)
+
+# Main model + Race
+model_race_full <- lm(logTime ~ Car * Generation + Race, data = pitstops_log)
+
+Anova(model_race_full, type = 2)
+par(mfrow = c(2,2))
+plot(model_race_full)
+```
+
+```{r splitGen-TukeyHSD}
+# --- Split data by generation ---
+gen1 <- subset(pitstops_gen, Generation == "Gen1_94_05")
+gen2 <- subset(pitstops_gen, Generation == "Gen2_06_10")
+
+# --- ANOVA within each generation ---
+model_gen1 <- aov(Time ~ Car + Race, data = gen1)
+model_gen2 <- aov(Time ~ Car + Race, data = gen2)
+
+summary(model_gen1)
+summary(model_gen2)
+
+# --- Tukey post-hoc comparisons ---
+# Gen1 Tukey
+tukey_gen1 <- as.data.frame(TukeyHSD(model_gen1)$Car)
+tukey_gen1$Comparison <- rownames(tukey_gen1)
+colnames(tukey_gen1) <- c("diff", "lower", "upper", "p_adj", "Comparison")
+tukey_gen1 <- tukey_gen1[, c("Comparison", "diff", "lower", "upper", "p_adj")]
+tukey_gen1 <- separate(tukey_gen1, Comparison, into = c("Team1", "Team2"), sep = "-")
+tukey_gen1$abs_diff <- abs(tukey_gen1$diff)
+
+sig_gen1 <- subset(tukey_gen1, p_adj < 0.05)
+
+# Gen2 Tukey
+tukey_gen2 <- as.data.frame(TukeyHSD(model_gen2)$Car)
+tukey_gen2$Comparison <- rownames(tukey_gen2)
+colnames(tukey_gen2) <- c("diff", "lower", "upper", "p_adj", "Comparison")
+tukey_gen2 <- tukey_gen2[, c("Comparison", "diff", "lower", "upper", "p_adj")]
+tukey_gen2 <- separate(tukey_gen2, Comparison, into = c("Team1", "Team2"), sep = "-")
+tukey_gen2$abs_diff <- abs(tukey_gen2$diff)
+
+sig_gen2 <- subset(tukey_gen2, p_adj < 0.05)
+
+top_sig_gen1 <- head(sig_gen1[order(-sig_gen1$abs_diff), ], 10)
+top_sig_gen2 <- head(sig_gen2[order(-sig_gen2$abs_diff), ], 10)
+top_sig_gen1; top_sig_gen2
+
+# --- Fastest teams (top 5) per generation ---
+gen1_means <- aggregate(Time ~ Car, data = gen1, mean)
+gen1_fastest <- gen1_means[order(gen1_means$Time), ][1:10, ]
+
+gen2_means <- aggregate(Time ~ Car, data = gen2, mean)
+gen2_fastest <- gen2_means[order(gen2_means$Time), ][1:10, ]
+
+gen1_fastest; gen2_fastest
+```
+
+```{r btGenTop5_95CI}
+# Gen1 summary for top 5 fastest teams with 95% CI
+gen1_plot_data <- gen1 %>%
+  filter(Car %in% gen1_fastest$Car) %>%
+  group_by(Car) %>%
+  summarise(
+    n = n(),
+    mean_time = mean(Time, na.rm = TRUE),
+    sd_time = sd(Time, na.rm = TRUE),
+    se_time = sd_time / sqrt(n),
+    ci_time = qt(0.975, df = n - 1) * se_time,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    se_time = ifelse(is.na(se_time), 0, se_time),
+    ci_time = ifelse(is.na(ci_time), 0, ci_time)
+  ) %>%
+  arrange(mean_time)
+
+# Gen2 summary for top 5 fastest teams with 95% CI
+gen2_plot_data <- gen2 %>%
+  filter(Car %in% gen2_fastest$Car) %>%
+  group_by(Car) %>%
+  summarise(
+    n = n(),
+    mean_time = mean(Time, na.rm = TRUE),
+    sd_time = sd(Time, na.rm = TRUE),
+    se_time = sd_time / sqrt(n),
+    ci_time = qt(0.975, df = n - 1) * se_time,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    se_time = ifelse(is.na(se_time), 0, se_time),
+    ci_time = ifelse(is.na(ci_time), 0, ci_time)
+  ) %>%
+  arrange(mean_time)
+
+p1 <- ggplot(gen1_plot_data, aes(x = reorder(Car, mean_time), y = mean_time)) +
+  geom_point(size = 3, color = "blue") +
+  geom_errorbar(aes(ymin = mean_time - ci_time, ymax = mean_time + ci_time),
+                width = 0.2, color = "blue") +
+  coord_flip() +
+  labs(title = "Gen1 (1994–2005): Top 5 Fastest Teams",
+       x = "Team",
+       y = "Mean Pit Stop Time (seconds) ± 95% CI") +
+  theme_minimal() +
+  theme(
+    aspect.ratio = 0.35,
+    axis.text.y = element_text(size = 10),
+    plot.margin = margin(5, 5, 5, 5)
+  )
+
+p2 <- ggplot(gen2_plot_data, aes(x = reorder(Car, mean_time), y = mean_time)) +
+  geom_point(size = 3, color = "red") +
+  geom_errorbar(aes(ymin = mean_time - ci_time, ymax = mean_time + ci_time),
+                width = 0.2, color = "red") +
+  coord_flip() +
+  labs(title = "Gen2 (2006–2010): Top 5 Fastest Teams",
+       x = "Team",
+       y = "Mean Pit Stop Time (seconds) ± 95% CI") +
+  theme_minimal() +
+  theme(
+    aspect.ratio = 0.35,
+    axis.text.y = element_text(size = 10),
+    plot.margin = margin(5, 5, 5, 5)
+  )
+
+p1; p2
+```
+
+```{r genPitStopTime}
+
+# Mean pit stop time per team per generation
+team_gen_means <- aggregate(Time ~ Car + Generation, data = pitstops_gen, mean)
+
+# --- 2. TREND OVER YEARS (IMPORTANT PLOT) ---
+year_means <- aggregate(Time ~ Year, data = pitstops_gen, mean)
+
+plot(year_means$Year, year_means$Time,
+     type = "b",
+     pch = 19,
+     lwd = 2,
+     col = "blue",
+     main = "Average Pit Stop Time Over Years",
+     xlab = "Year",
+     ylab = "Average Pit Stop Time")
+
+# Add generation split line
+abline(v = 2005.5, col = "red", lty = 2)
+
+# --- 3. GENERATION COMPARISON ---
+
+boxplot(Time ~ Generation, data = pitstops_gen,
+        col = c("lightblue", "lightcoral"),
+        main = "Pit Stop Time by Generation",
+        ylab = "Time")
+```
+
+```{r pitStopTrendsPlot}
+# --- Aggregate mean per Year × Car × Generation ---
+agg <- aggregate(Time ~ Year + Car + Generation, data = pitstops_gen, mean)
+
+# --- Find top 5 teams (by total observations, not just appearance in one year) ---
+team_counts <- sort(table(pitstops_gen$Car), decreasing = TRUE)
+top10 <- names(team_counts)[1:5]
+
+# Subset aggregated data
+plot_data <- subset(agg, Car %in% top5)
+plot_data$Car <- droplevels(plot_data$Car)
+
+# --- Plot ---
+ggplot(plot_data, aes(x = factor(Year), y = Time, color = Car, group = Car)) +
+  geom_line(size = 1) +
+  geom_point() +
+  facet_wrap(~ Generation, scales = "free_x") +
+  labs(title = "Top 5 Teams: Pit Stop Trends by Generation",
+       x = "Year",
+       y = "Mean Pit Stop Time") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+```
+
+```{r correlation}
+# Keep only the most meaningful numeric variables for correlation
+corr_vars <- pitstops_gen[, c("Time", "Year", "Lap", "Stops")]
+
+# Summary
+summary(corr_vars)
+
+# Correlation matrix
+cor_matrix <- cor(corr_vars, use = "pairwise.complete.obs", method = "pearson")
+round(cor_matrix, 3)
+
+# Pairwise correlation tests
+cor_driver <- function(data) {
+  vars <- names(data)
+  results <- data.frame(
+    Var1 = character(),
+    Var2 = character(),
+    Correlation = numeric(),
+    p_value = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  for (i in 1:(length(vars) - 1)) {
+    for (j in (i + 1):length(vars)) {
+      x <- data[[vars[i]]]
+      y <- data[[vars[j]]]
+      keep <- complete.cases(x, y)
+      
+      test <- cor.test(x[keep], y[keep], method = "pearson")
+      
+      results <- rbind(results, data.frame(
+        Var1 = vars[i],
+        Var2 = vars[j],
+        Correlation = unname(test$estimate),
+        p_value = test$p.value,
+        stringsAsFactors = FALSE
+      ))
+    }
+  }
+  
+  results[order(-abs(results$Correlation)), ]
+}
+
+cor_results <- cor_driver(corr_vars)
+cor_results
+
+# Visual correlation plot
+corrplot(cor_matrix, method = "color", type = "upper",
+         tl.col = "black", tl.srt = 45)
+
+# Scatterplots against Time
+par(mfrow = c(1, 3))
+
+plot(pitstops_gen$Year, pitstops_gen$Time,
+     xlab = "Year", ylab = "Pit Stop Time",
+     main = "Time vs Year", pch = 19)
+abline(lm(Time ~ Year, data = pitstops_gen), col = "red", lwd = 2)
+
+plot(pitstops_gen$Lap, pitstops_gen$Time,
+     xlab = "Lap", ylab = "Pit Stop Time",
+     main = "Time vs Lap", pch = 19)
+abline(lm(Time ~ Lap, data = pitstops_gen), col = "red", lwd = 2)
+
+plot(pitstops_gen$Stops, pitstops_gen$Time,
+     xlab = "Stops", ylab = "Pit Stop Time",
+     main = "Time vs Stops", pch = 19)
+abline(lm(Time ~ Stops, data = pitstops_gen), col = "red", lwd = 2)
+
+par(mfrow = c(1, 1))
+
+# -----------------------------
+# Race as a categorical factor
+# -----------------------------
+
+# One-way ANOVA for Race
+model_race <- aov(Time ~ Race, data = pitstops_gen)
+summary(model_race)
+
+# Mean pit stop time by Race
+race_summary <- aggregate(Time ~ Race, data = pitstops_gen, mean)
+race_summary <- race_summary[order(race_summary$Time), ]
+race_summary
+
+# Top 5 shortest and longest races
+top_short_races <- head(race_summary, 5)
+top_long_races  <- tail(race_summary, 5)
+extreme_races   <- rbind(top_short_races, top_long_races)
+
+extreme_races
+
+# Plot shortest and longest races
+ggplot(extreme_races, aes(x = reorder(Race, Time), y = Time)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Races with the Shortest and Longest Mean Pit Stop Times",
+       x = "Race",
+       y = "Mean Pit Stop Time (seconds)") +
+  theme_minimal()
+```
+
+```{r 2010 mean time check, include=FALSE}
+# 2010 only
+pit2010 <- subset(pitstops_gen, Year == 2010)
+
+# Summary stats
+summary(pit2010$Time)
+mean(pit2010$Time, na.rm = TRUE)
+median(pit2010$Time, na.rm = TRUE)
+quantile(pit2010$Time, probs = c(0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99), na.rm = TRUE)
+
+# If you want trimmed 2010 too
+pit2010_trim <- subset(pitstops_gen, Year == 2010 & Time <= 300)
+
+summary(pit2010_trim$Time)
+mean(pit2010_trim$Time, na.rm = TRUE)
+median(pit2010_trim$Time, na.rm = TRUE)
+quantile(pit2010_trim$Time, probs = c(0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99), na.rm = TRUE)
+
+# Histogram
+hist(pit2010_trim$Time,
+     breaks = 30,
+     main = "2010 Pit Stop Time Distribution",
+     xlab = "Pit Stop Time")
+
+# Fastest average teams in 2010
+team2010 <- aggregate(Time ~ Car, data = pit2010_trim, mean)
+team2010[order(team2010$Time), ][1:10, ]
+```
+
+```{r racePlots}
+# Use the final filtered dataset
+race_data <- pitstops_gen
+
+# -----------------------------
+# 1. Mean pit stop time by race
+# -----------------------------
+race_summary <- race_data %>%
+  group_by(Race) %>%
+  summarise(
+    n = n(),
+    mean_time = mean(Time, na.rm = TRUE),
+    sd_time = sd(Time, na.rm = TRUE),
+    se_time = sd_time / sqrt(n),
+    ci_time = qt(0.975, df = n - 1) * se_time,
+    .groups = "drop"
+  ) %>%
+  arrange(mean_time)
+
+# Full race means table
+race_summary
+
+# -----------------------------------------
+# 2. Top 5 shortest and top 5 longest races
+# -----------------------------------------
+top_short_races <- head(race_summary, 5)
+top_long_races  <- tail(race_summary, 5)
+extreme_races   <- bind_rows(top_short_races, top_long_races)
+
+extreme_races
+
+# Bar plot for shortest/longest races
+p_race_bar <- ggplot(extreme_races, aes(x = reorder(Race, mean_time), y = mean_time)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Races with the Shortest and Longest Mean Pit Stop Times",
+       x = "Race",
+       y = "Mean Pit Stop Time (seconds)") +
+  theme_minimal()
+
+p_race_bar
+
+# Error bar plot for shortest/longest races
+p_race_error <- ggplot(extreme_races, aes(x = reorder(Race, mean_time), y = mean_time)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean_time - ci_time, ymax = mean_time + ci_time), width = 0.2) +
+  coord_flip() +
+  labs(title = "Shortest and Longest Mean Pit Stop Times by Race",
+       x = "Race",
+       y = "Mean Pit Stop Time (seconds) ± 95% CI") +
+  theme_minimal()
+
+p_race_error
+
+# -----------------------------
+# 3. Boxplot by race
+# -----------------------------
+# Top 10 races by frequency only, so it stays readable
+top_races_freq <- race_data %>%
+  count(Race, sort = TRUE) %>%
+  slice(1:10) %>%
+  pull(Race)
+
+race_box_data <- subset(race_data, Race %in% top_races_freq)
+
+p_race_box <- ggplot(race_box_data, aes(x = reorder(Race, Time, FUN = median), y = Time)) +
+  geom_boxplot() +
+  coord_flip() +
+  labs(title = "Pit Stop Time Distribution for the 10 Most Frequent Races",
+       x = "Race",
+       y = "Pit Stop Time (seconds)") +
+  theme_minimal()
+
+p_race_box
+
+# ----------------------------------------
+# 4. Mean pit stop time by race and generation
+# ----------------------------------------
+race_gen_summary <- race_data %>%
+  group_by(Race, Generation) %>%
+  summarise(
+    n = n(),
+    mean_time = mean(Time, na.rm = TRUE),
+    sd_time = sd(Time, na.rm = TRUE),
+    se_time = sd_time / sqrt(n),
+    ci_time = qt(0.975, df = n - 1) * se_time,
+    .groups = "drop"
+  )
+
+race_gen_summary
+
+# Plot all race means split by generation
+p_race_gen <- ggplot(race_gen_summary, aes(x = reorder(Race, mean_time), y = mean_time, fill = Generation)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  labs(title = "Mean Pit Stop Time by Race and Generation",
+       x = "Race",
+       y = "Mean Pit Stop Time (seconds)") +
+  theme_minimal()
+
+p_race_gen
+
+# --------------------------------------------------
+# 5. Only races appearing in both generations
+# --------------------------------------------------
+overlap_races <- race_data %>%
+  group_by(Race) %>%
+  summarise(n_gen = n_distinct(Generation), .groups = "drop") %>%
+  filter(n_gen == 2) %>%
+  pull(Race)
+
+race_overlap_data <- race_gen_summary %>%
+  filter(Race %in% overlap_races)
+
+p_race_overlap <- ggplot(race_overlap_data,
+                         aes(x = Generation, y = mean_time, group = Race, color = Race)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  labs(title = "Mean Pit Stop Time by Generation for Races Appearing in Both Eras",
+       x = "Generation",
+       y = "Mean Pit Stop Time (seconds)",
+       color = "Race") +
+  theme_minimal()
+
+p_race_overlap
+
+# --------------------------------------------------
+# 6. Heatmap of mean pit stop time by race and generation
+# --------------------------------------------------
+p_race_heat <- ggplot(race_gen_summary, aes(x = Generation, y = Race, fill = mean_time)) +
+  geom_tile() +
+  labs(title = "Heatmap of Mean Pit Stop Time by Race and Generation",
+       x = "Generation",
+       y = "Race",
+       fill = "Mean Time") +
+  theme_minimal()
+
+p_race_heat
+```
+

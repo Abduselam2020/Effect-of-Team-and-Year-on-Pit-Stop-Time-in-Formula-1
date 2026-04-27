@@ -63,3 +63,6 @@ This project also demonstrates:
 ## Future Improvements
 
 Future versions of this project could include additional seasons, more detailed regulation periods, and more teams. Post-hoc tests such as Tukey HSD could be added to identify which specific teams, generations, or track locations differ from each other. The analysis could also be extended with regression or machine learning models to predict pit stop time using additional variables such as lap number, race, stop number, driver, season, and circuit characteristics.
+
+
+Dataset link: https://www.kaggle.com/datasets/jtrotman/formula-1-pitstops-1994-2010
